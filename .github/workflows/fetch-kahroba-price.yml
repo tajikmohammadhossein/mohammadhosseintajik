@@ -1,221 +1,308 @@
-name: Fetch Kahroba closing price
+
+name: Fetch Kahroba Closing Price
 
 on:
   workflow_dispatch:
   schedule:
-    # 20:00 Iran time (UTC+03:30), Saturday through Wednesday.
-    # GitHub cron uses UTC: Saturday=6, Sunday=0 ... Wednesday=3.
     - cron: "30 16 * * 0-3,6"
 
 permissions:
   contents: read
 
-concurrency:
-  group: kahroba-price-fetch
-  cancel-in-progress: false
-
 jobs:
   fetch-price:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+
     steps:
-      - name: Fetch closing price (TSETMC primary, Tindex fallback)
-        shell: bash
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Fetch and save Kahroba price
         run: |
           python - <<'PY'
           import json
           import re
           import time
           import os
+          import html
+          import urllib.request
+          import urllib.parse
           from datetime import datetime, timezone
-          from html.parser import HTMLParser
-          from urllib.request import Request, urlopen
-          from urllib.parse import quote
 
           SYMBOL = "کهربا"
-          TRANS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+
           HEADERS = {
-              "User-Agent": "Mozilla/5.0 (compatible; PortfolioPriceBot/1.0)",
-              "Accept": "application/json,text/plain,text/html,*/*",
-              "Referer": "https://www.tsetmc.com/"
+              "User-Agent": "Mozilla/5.0",
+              "Accept": "application/json,text/html,*/*"
           }
 
-          def get(url, accept=None):
-              headers = dict(HEADERS)
-              if accept:
-                  headers["Accept"] = accept
-              req = Request(url, headers=headers)
-              with urlopen(req, timeout=20) as response:
-                  return response.status, response.read().decode("utf-8", "replace")
+          def get_url(url, timeout=20):
+              req = urllib.request.Request(url, headers=HEADERS)
+              with urllib.request.urlopen(req, timeout=timeout) as response:
+                  return response.read().decode("utf-8", errors="replace")
 
-          def to_int(value):
+          def to_number(value):
               if value is None:
                   return None
-              if isinstance(value, (int, float)):
-                  return int(value)
-              s = str(value).translate(TRANS)
-              s = re.sub(r"[^0-9]", "", s)
-              return int(s) if s else None
+              text = str(value)
+              text = text.translate(str.maketrans(
+                  "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
+                  "01234567890123456789"
+              ))
+              text = text.replace(",", "").replace("٬", "").strip()
+              try:
+                  return int(float(text))
+              except (ValueError, TypeError):
+                  return None
 
-          def find_tsetmc_price():
-              search_url = "https://cdn.tsetmc.com/api/Instrument/GetInstrumentSearch/" + quote(SYMBOL)
-              status, body = get(search_url, "application/json,*/*")
-              data = json.loads(body)
-              instruments = data.get("instrumentSearch") or data.get("instrumentsearch") or []
-              match = next(
-                  (item for item in instruments
-                   if SYMBOL in str(item.get("lVal18AFC", "")) or SYMBOL in str(item.get("lVal30", ""))),
-                  None
+          def find_instrument(data):
+              if isinstance(data, dict):
+                  code = data.get("insCode")
+                  names = [
+                      str(data.get("lVal18AFC", "")),
+                      str(data.get("lVal30", "")),
+                      str(data.get("lVal18", ""))
+                  ]
+                  if code and any(SYMBOL in name for name in names):
+                      return str(code)
+
+                  for value in data.values():
+                      result = find_instrument(value)
+                      if result:
+                          return result
+
+              elif isinstance(data, list):
+                  for item in data:
+                      result = find_instrument(item)
+                      if result:
+                          return result
+
+              return None
+
+          def find_closing_price(data):
+              if isinstance(data, dict):
+                  value = to_number(data.get("pClosing"))
+                  if value and value > 0:
+                      return value
+
+                  for item in data.values():
+                      result = find_closing_price(item)
+                      if result:
+                          return result
+
+              elif isinstance(data, list):
+                  for item in data:
+                      result = find_closing_price(item)
+                      if result:
+                          return result
+
+              return None
+
+          def fetch_tsetmc():
+              search_url = (
+                  "https://cdn.tsetmc.com/api/Instrument/GetInstrumentSearch/"
+                  + urllib.parse.quote(SYMBOL)
               )
-              if not match or not match.get("insCode"):
-                  raise RuntimeError("TSETMC instrument search returned no matching insCode")
-              ins_code = str(match["insCode"])
-              price_url = "https://cdn.tsetmc.com/api/ClosingPrice/GetClosingPriceInfo/" + ins_code
-              price_status, price_body = get(price_url, "application/json,*/*")
-              price_data = json.loads(price_body)
-              info = price_data.get("closingPriceInfo") or price_data.get("closingpriceinfo") or price_data
-              closing = to_int(info.get("pClosing") or info.get("pclosing"))
-              last = to_int(info.get("pDrCotVal") or info.get("pdrCotval"))
-              if closing is None or closing <= 0:
-                  raise RuntimeError("TSETMC response did not contain a valid pClosing closing price")
-              return {
-                  "symbol": SYMBOL,
-                  "instrument_name": match.get("lVal30"),
-                  "ins_code": ins_code,
-                  "source": "TSETMC",
-                  "source_url": price_url,
-                  "http_status": price_status,
-                  "closing_price_irr": closing,
-                  "last_price_irr": last,
-              }
 
-          class Text(HTMLParser):
-              def __init__(self):
-                  super().__init__()
-                  self.parts = []
-              def handle_data(self, data):
-                  if data.strip():
-                      self.parts.append(data.strip())
+              search_data = json.loads(get_url(search_url))
+              instrument_code = find_instrument(search_data)
 
-          def find_tindex_price():
-              url = "https://tindex.app/stocks/" + quote(SYMBOL) + "/"
-              status, html = get(url, "text/html,*/*")
-              parser = Text()
-              parser.feed(html)
-              page = " ".join(parser.parts)
-              closing = re.search(r"قیمت\s*پایانی\s*([۰-۹0-9٬,]+)\s*ریال", page)
-              last = re.search(r"آخرین\s*قیمت\s*([۰-۹0-9٬,]+)\s*ریال", page)
-              if not closing:
-                  raise RuntimeError("Tindex page did not expose a clearly labeled closing price in rial")
-              close_value = to_int(closing.group(1))
-              last_value = to_int(last.group(1)) if last else None
-              if not close_value or close_value <= 0:
-                  raise RuntimeError("Tindex returned an invalid closing price")
-              return {
-                  "symbol": SYMBOL,
-                  "source": "Tindex",
-                  "source_url": url,
-                  "http_status": status,
-                  "closing_price_irr": close_value,
-                  "last_price_irr": last_value,
-              }
+              if not instrument_code:
+                  raise RuntimeError("Kahroba instrument code not found")
 
-          result = None
-          failures = []
-          for source_name, fetcher in (("TSETMC", find_tsetmc_price), ("Tindex", find_tindex_price)):
+              price_url = (
+                  "https://cdn.tsetmc.com/api/ClosingPrice/GetClosingPriceInfo/"
+                  + instrument_code
+              )
+
+              price_data = json.loads(get_url(price_url))
+              closing_price = find_closing_price(price_data)
+
+              if not closing_price:
+                  raise RuntimeError("TSETMC closing price not found")
+
+              return closing_price, price_url
+
+          def fetch_tindex():
+              url = "https://tindex.app/stocks/کهربا/"
+              page = get_url(url)
+              text = html.unescape(re.sub(r"<[^>]+>", " ", page))
+              text = re.sub(r"\s+", " ", text)
+
+              patterns = [
+                  r"قیمت\s*پایانی\s*[:：]?\s*([\d,٬]+)",
+                  r"پایانی\s*[:：]?\s*([\d,٬]+)"
+              ]
+
+              for pattern in patterns:
+                  match = re.search(pattern, text)
+                  if match:
+                      price = to_number(match.group(1))
+                      if price and price > 0:
+                          return price, url
+
+              raise RuntimeError(
+                  "Could not identify a clearly labeled closing price on Tindex"
+              )
+
+          closing_price = None
+          source = None
+          source_url = None
+          errors = []
+
+          # First choice: TSETMC
+          for attempt in range(2):
+              try:
+                  closing_price, source_url = fetch_tsetmc()
+                  source = "TSETMC"
+                  break
+              except Exception as exc:
+                  errors.append(f"TSETMC attempt {attempt + 1}: {exc}")
+                  time.sleep(2)
+
+          # Backup: Tindex
+          if closing_price is None:
               for attempt in range(2):
                   try:
-                      result = fetcher()
-                      print(f"PRICE_SOURCE_SUCCESS: {source_name}")
+                      closing_price, source_url = fetch_tindex()
+                      source = "Tindex"
                       break
                   except Exception as exc:
-                      message = f"{source_name} attempt {attempt + 1}: {type(exc).__name__}: {exc}"
-                      failures.append(message)
-                      print("PRICE_SOURCE_FAILED:", message)
-                      if attempt == 0:
-                          time.sleep(3)
-              if result:
-                  break
+                      errors.append(f"Tindex attempt {attempt + 1}: {exc}")
+                      time.sleep(2)
 
-          if not result:
-              raise SystemExit("All price sources failed. " + " | ".join(failures))
+          if closing_price is None:
+              raise RuntimeError(
+                  "Unable to fetch Kahroba price. " + " | ".join(errors)
+              )
 
-          now = datetime.now(timezone.utc).isoformat()
-          closing = result["closing_price_irr"]
-          last = result.get("last_price_irr")
-          result.update({
+          fetched_at = datetime.now(timezone.utc).isoformat()
+
+          result = {
+              "symbol": SYMBOL,
+              "source": source,
+              "source_url": source_url,
+              "closing_price_irr": closing_price,
+              "closing_price_toman": closing_price / 10,
               "currency": "IRR",
-              "closing_price_toman": closing / 10,
-              "last_price_toman": last / 10 if last is not None else None,
-              "fetched_at_utc": now,
-              "failover_errors": failures,
-              "data_type": "official_closing_price"
-          })
+              "data_type": "closing_price",
+              "fetched_at_utc": fetched_at,
+              "failover_errors": errors
+          }
 
-          with open("kahroba-price.json", "w", encoding="utf-8") as f:
-              json.dump(result, f, ensure_ascii=False, indent=2)
+          with open("kahroba-price.json", "w", encoding="utf-8") as file:
+              json.dump(result, file, ensure_ascii=False, indent=2)
 
-          print("CLOSING_PRICE_RIAL:", closing)
-          print("CLOSING_PRICE_TOMAN:", closing / 10)
-          print("SOURCE:", result["source"])
-          print("FETCHED_AT_UTC:", now)
+          print("SYMBOL:", SYMBOL)
+          print("SOURCE:", source)
+          print("CLOSING_PRICE_RIAL:", closing_price)
+          print("CLOSING_PRICE_TOMAN:", closing_price / 10)
+          print("FETCHED_AT_UTC:", fetched_at)
 
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
-              f.write("# قیمت پایانی صندوق کهربا\n\n")
-              f.write(f"- قیمت پایانی: **{closing:,} ریال**\n")
-              f.write(f"- منبع موفق: **{result['source']}**\n")
-              f.write(f"- زمان دریافت UTC: {now}\n")
-              if failures:
-                  f.write("\n## خطاهای منابع قبلی\n")
-                  for failure in failures:
-                      f.write(f"- {failure}\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("# گزارش قیمت کهربا\n\n")
+              summary.write(f"- منبع: {source}\n")
+              summary.write(f"- قیمت پایانی: {closing_price:,} ریال\n")
+              summary.write(f"- قیمت پایانی: {closing_price / 10:,.1f} تومان\n")
+              summary.write(f"- زمان دریافت: {fetched_at}\n")
           PY
 
       - name: Send price to Google Sheets
         env:
           GOOGLE_APPS_SCRIPT_URL: ${{ secrets.GOOGLE_APPS_SCRIPT_URL }}
-        shell: bash
+          KAHROBA_WEBHOOK_SECRET: ${{ secrets.KAHROBA_WEBHOOK_SECRET }}
         run: |
-          if [ -z "$GOOGLE_APPS_SCRIPT_URL" ]; then
-            echo "Google Sheets delivery skipped: GOOGLE_APPS_SCRIPT_URL secret is not configured."
-            echo "Add the deployed Apps Script Web App URL as repository secret GOOGLE_APPS_SCRIPT_URL."
-            exit 0
-          fi
           python - <<'PY'
-          import json, os
-          from urllib.request import Request, urlopen
+          import json
+          import os
+          import urllib.request
+          import urllib.error
 
-          with open("kahroba-price.json", encoding="utf-8") as f:
-              payload = json.load(f)
+          url = os.environ.get("GOOGLE_APPS_SCRIPT_URL", "").strip()
+          secret = os.environ.get("KAHROBA_WEBHOOK_SECRET", "").strip()
 
-          req = Request(
-              os.environ["GOOGLE_APPS_SCRIPT_URL"],
-              data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+          if not url:
+              raise RuntimeError("GOOGLE_APPS_SCRIPT_URL secret is missing")
+
+          if not secret:
+              raise RuntimeError("KAHROBA_WEBHOOK_SECRET secret is missing")
+
+          with open("kahroba-price.json", "r", encoding="utf-8") as file:
+              payload = json.load(file)
+
+          payload["secret"] = secret
+
+          body = json.dumps(payload).encode("utf-8")
+
+          request = urllib.request.Request(
+              url,
+              data=body,
               headers={"Content-Type": "application/json"},
               method="POST"
           )
-          with urlopen(req, timeout=30) as response:
-              body = response.read().decode("utf-8", "replace")
-              print("GOOGLE_SHEETS_HTTP_STATUS:", response.status)
-              print("GOOGLE_SHEETS_RESPONSE:", body[:2000])
-              if response.status < 200 or response.status >= 300:
-                  raise RuntimeError("Google Apps Script returned a non-success HTTP status")
 
           try:
-              confirmation = json.loads(body)
-          except Exception:
-              confirmation = {}
-          if confirmation.get("ok") is not True:
-              raise RuntimeError("Google Apps Script did not confirm successful write: " + body[:500])
+              with urllib.request.urlopen(request, timeout=40) as response:
+                  status = response.status
+                  response_text = response.read().decode(
+                      "utf-8", errors="replace"
+                  )
 
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
-              f.write("\n- Google Sheets: **ثبت با تأیید سرور انجام شد**\n")
+          except urllib.error.HTTPError as error:
+              response_text = error.read().decode(
+                  "utf-8", errors="replace"
+              )
+              raise RuntimeError(
+                  f"Google Sheets HTTP error: {error.code}. "
+                  f"Response: {response_text[:1000]}"
+              )
+
+          print("GOOGLE_SHEETS_HTTP_STATUS:", status)
+          print("GOOGLE_SHEETS_RESPONSE:", response_text[:1000])
+
+          try:
+              confirmation = json.loads(response_text)
+          except json.JSONDecodeError:
+              raise RuntimeError(
+                  "Google Apps Script did not return JSON. "
+                  "Check Web App deployment and access settings."
+              )
+
+          if confirmation.get("ok") is not True:
+              raise RuntimeError(
+                  "Google Apps Script did not confirm success: "
+                  + str(confirmation)
+              )
+
+          if confirmation.get("saved") is not True:
+              raise RuntimeError(
+                  "Google Apps Script did not confirm that the row was saved."
+              )
+
+          if confirmation.get("symbol") != payload["symbol"]:
+              raise RuntimeError("Saved symbol does not match.")
+
+          if int(confirmation.get("price", 0)) != int(
+              payload["closing_price_irr"]
+          ):
+              raise RuntimeError("Saved price does not match.")
+
+          print("GOOGLE_SHEETS_SAVE_CONFIRMED: YES")
+          print("SAVED_SYMBOL:", confirmation["symbol"])
+          print("SAVED_PRICE_RIAL:", confirmation["price"])
+          print("SAVED_ROW:", confirmation.get("row", "not provided"))
           PY
 
-      - name: Upload price JSON
+      - name: Upload price data
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: kahroba-price
           path: kahroba-price.json
-          if-no-files-found: error
-          retention-days: 14
+          if-no-files-found: ignore
