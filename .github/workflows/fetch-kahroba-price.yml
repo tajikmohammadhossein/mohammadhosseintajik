@@ -1,4 +1,3 @@
-
 name: Fetch Kahroba Closing Price
 
 on:
@@ -15,273 +14,364 @@ jobs:
     timeout-minutes: 8
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Ask OpenAI to verify Kahroba closing price
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      - name: Fetch and verify Kahroba closing price (free sources)
         run: |
           python - <<'PY'
-          import os
           import json
           import re
+          import time
+          import html
           import urllib.request
           import urllib.error
           from datetime import datetime, date, timezone
           from zoneinfo import ZoneInfo
-          from urllib.parse import urlparse
+          from decimal import Decimal, InvalidOperation
+          from urllib.parse import quote
 
           SYMBOL = "کهربا"
-          MODEL = "gpt-6-astra"
-
-          ALLOWED_DOMAINS = {
-              "tsetmc.com",
-              "tindex.app",
-              "rahavard365.com"
-          }
-
-          api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-          if not api_key:
-              raise RuntimeError("OPENAI_API_KEY secret is missing")
-
-          prompt = """
-          وظیفه تو استخراج و اعتبارسنجی قیمت پایانی صندوق کهربا در بورس ایران است.
-
-          قوانین الزامی:
-          1. فقط قیمت پایانی رسمی را استخراج کن، نه آخرین معامله.
-          2. واحد قیمت حتماً ریال باشد.
-          3. تاریخ آخرین جلسه معاملاتی تکمیل‌شده را مشخص کن.
-          4. منابع معتبر را جستجو کن؛ اولویت با TSETMC است.
-          5. در صورت امکان قیمت را با منبع دوم نیز تطبیق بده.
-          6. هیچ عددی را حدس نزن یا از داده قدیمی استنتاج نکن.
-          7. لینک منبع باید مستقیم و قابل بررسی باشد.
-          8. اگر قیمت یا تاریخ یا منبع قابل تأیید نیست،
-             verified را false قرار بده.
-          9. قیمت باید عدد صحیح مثبت و به ریال باشد.
-          10. اگر منابع اختلاف دارند، verified=false.
-          11. تاریخ باید میلادی و به شکل YYYY-MM-DD باشد.
-          12. اگر بازار تعطیل است، آخرین جلسه معاملاتی کامل را گزارش کن.
-
-          فقط JSON معتبر و بدون Markdown برگردان:
-
-          {
-            "symbol": "کهربا",
-            "verified": true,
-            "closing_price_irr": 12345,
-            "price_date": "2026-11-15",
-            "price_type": "closing_price",
-            "currency": "IRR",
-            "source_name": "TSETMC",
-            "source_url": "https://...",
-            "second_source_url": null,
-            "confidence": "high",
-            "reason": "توضیح کوتاه اعتبارسنجی"
-          }
-
-          اگر اطلاعات تأیید نشد، verified=false و قیمت null باشد.
-          هرگز اطلاعات ساختگی تولید نکن.
-          """
-
-          request_body = {
-              "model": MODEL,
-              "tools": [{
-                  "type": "web_search",
-                  "search_context_size": "high",
-                  "filters": {
-                      "allowed_domains": sorted(ALLOWED_DOMAINS)
-                  }
-              }],
-              "include": [
-                  "web_search_call.action.sources"
-              ],
-              "input": prompt
-          }
-
-          req = urllib.request.Request(
-              "https://api.openai.com/v1/responses",
-              data=json.dumps(request_body).encode("utf-8"),
-              headers={
-                  "Authorization": f"Bearer {api_key}",
-                  "Content-Type": "application/json"
-              },
-              method="POST"
+          TINDEX_URL = "https://tindex.app/stocks/کهربا/"
+          TSETMC_SEARCH_URL = (
+              "https://cdn.tsetmc.com/api/Instrument/GetInstrumentSearch/"
+              + quote(SYMBOL)
           )
+          HEADERS = {
+              "User-Agent": (
+                  "Mozilla/5.0 (X11; Linux x86_64) "
+                  "AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
+              ),
+              "Accept": "application/json,text/html,*/*",
+              "Accept-Language": "fa-IR,fa;q=0.9,en;q=0.8",
+          }
 
-          try:
-              with urllib.request.urlopen(req, timeout=150) as response:
-                  api_data = json.loads(
-                      response.read().decode("utf-8")
-                  )
-          except urllib.error.HTTPError as exc:
-              details = exc.read().decode("utf-8", errors="replace")
-              raise RuntimeError(
-                  f"OpenAI API HTTP {exc.code}: {details[:1500]}"
+          DIGITS = str.maketrans(
+              "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
+              "012345678901234567890123456789"
+          )
+          MONTHS = {
+              "فروردین": 1, "اردیبهشت": 2, "خرداد": 3,
+              "تیر": 4, "مرداد": 5, "شهریور": 6,
+              "مهر": 7, "آبان": 8, "آذر": 9,
+              "دی": 10, "بهمن": 11, "اسفند": 12,
+          }
+
+          def normalize_text(value):
+              return (
+                  str(value or "")
+                  .replace("ي", "ی")
+                  .replace("ك", "ک")
+                  .replace("\u200c", "")
+                  .strip()
               )
 
-          if api_data.get("status") != "completed":
-              raise RuntimeError(
-                  "OpenAI response did not complete: "
-                  + str(api_data.get("status"))
-              )
+          def get_url(url, timeout=25, attempts=3):
+              errors = []
+              for attempt in range(1, attempts + 1):
+                  request = urllib.request.Request(url, headers=HEADERS)
+                  try:
+                      with urllib.request.urlopen(request, timeout=timeout) as response:
+                          body = response.read()
+                          if response.status != 200:
+                              raise RuntimeError(f"HTTP {response.status}")
+                          return body.decode("utf-8", errors="replace")
+                  except Exception as exc:
+                      errors.append(f"attempt {attempt}: {type(exc).__name__}: {exc}")
+                      if attempt < attempts:
+                          time.sleep(attempt * 2)
+              raise RuntimeError(" | ".join(errors))
 
-          output_text = ""
-          searched_sources = []
+          def get_json(url):
+              raw = get_url(url)
+              try:
+                  return json.loads(raw)
+              except json.JSONDecodeError as exc:
+                  raise RuntimeError(f"Non-JSON response from {url}: {exc}")
 
-          for item in api_data.get("output", []):
-              if item.get("type") == "web_search_call":
-                  action = item.get("action") or {}
-                  for source in action.get("sources", []):
-                      url = source.get("url")
-                      if url:
-                          searched_sources.append(url)
-
-              if item.get("type") == "message":
-                  for content in item.get("content", []):
-                      if content.get("type") == "output_text":
-                          output_text += content.get("text", "")
-
-          if not searched_sources:
-              raise RuntimeError(
-                  "No actual web search sources were returned."
-              )
-
-          if not output_text.strip():
-              raise RuntimeError("OpenAI returned no usable answer.")
-
-          try:
-              result = json.loads(output_text)
-          except json.JSONDecodeError:
-              raise RuntimeError(
-                  "OpenAI response was not valid JSON: "
-                  + output_text[:1000]
-              )
-
-          def normalize_domain(url):
-              parsed = urlparse(url)
-              if parsed.scheme != "https":
+          def to_price(value):
+              if value is None or isinstance(value, bool):
                   return None
-              return (parsed.hostname or "").lower()
+              raw = str(value).translate(DIGITS)
+              raw = raw.replace(",", "").replace("٬", "").replace(" ", "")
+              raw = raw.replace("٫", ".")
+              try:
+                  number = Decimal(raw)
+              except InvalidOperation:
+                  return None
+              if number <= 0 or number != number.to_integral_value():
+                  return None
+              return int(number)
 
-          def valid_domain(url):
-              domain = normalize_domain(url)
-              if not domain:
-                  return False
-              return any(
-                  domain == allowed or domain.endswith("." + allowed)
-                  for allowed in ALLOWED_DOMAINS
+          def gregorian_to_jalali(gy, gm, gd):
+              gdm = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+              if gy > 1600:
+                  jy = 979
+                  gy -= 1600
+              else:
+                  jy = 0
+                  gy -= 621
+              gy2 = gy + 1 if gm > 2 else gy
+              days = (
+                  365 * gy
+                  + (gy2 + 3) // 4
+                  - (gy2 + 99) // 100
+                  + (gy2 + 399) // 400
+                  - 80 + gd + gdm[gm - 1]
               )
+              jy += 33 * (days // 12053)
+              days %= 12053
+              jy += 4 * (days // 1461)
+              days %= 1461
+              if days > 365:
+                  jy += (days - 1) // 365
+                  days = (days - 1) % 365
+              if days < 186:
+                  jm = 1 + days // 31
+                  jd = 1 + days % 31
+              else:
+                  jm = 7 + (days - 186) // 30
+                  jd = 1 + (days - 186) % 30
+              return jy, jm, jd
 
-          if result.get("verified") is not True:
-              raise RuntimeError(
-                  "AI could not verify the price: "
-                  + str(result.get("reason", "Unknown reason"))
+          def jalali_to_gregorian(jy, jm, jd):
+              jy += 1595
+              days = (
+                  -355668 + 365 * jy + (jy // 33) * 8
+                  + ((jy % 33 + 3) // 4) + jd
               )
+              if jm < 7:
+                  days += (jm - 1) * 31
+              else:
+                  days += (jm - 7) * 30 + 186
 
-          if result.get("symbol") != SYMBOL:
-              raise RuntimeError("Symbol mismatch.")
+              gy = 400 * (days // 146097)
+              days %= 146097
+              if days > 36524:
+                  gy += 100 * ((days - 1) // 36524)
+                  days = (days - 1) % 36524
+                  if days >= 365:
+                      days += 1
+              gy += 4 * (days // 1461)
+              days %= 1461
+              if days > 365:
+                  gy += (days - 1) // 365
+                  days = (days - 1) % 365
+              gd = days + 1
+              leap = (gy % 4 == 0 and gy % 100 != 0) or gy % 400 == 0
+              month_days = [
+                  0, 31, 29 if leap else 28, 31, 30, 31, 30,
+                  31, 31, 30, 31, 30, 31
+              ]
+              gm = 1
+              while gm <= 12 and gd > month_days[gm]:
+                  gd -= month_days[gm]
+                  gm += 1
+              return date(gy, gm, gd)
 
-          if result.get("price_type") != "closing_price":
-              raise RuntimeError("Price is not closing price.")
-
-          if result.get("currency") != "IRR":
-              raise RuntimeError("Price currency must be IRR.")
-
-          if result.get("confidence") != "high":
-              raise RuntimeError("Confidence is not high.")
-
-          price = result.get("closing_price_irr")
-          if isinstance(price, bool) or not isinstance(price, int) or price <= 0:
-              raise RuntimeError("Invalid closing price.")
-
-          price_date = result.get("price_date")
-          try:
-              parsed_date = date.fromisoformat(price_date)
-          except (ValueError, TypeError):
-              raise RuntimeError("Invalid price date.")
-
-          today_tehran = datetime.now(
-              ZoneInfo("Asia/Tehran")
-          ).date()
-
-          age = (today_tehran - parsed_date).days
-
-          if age < 0 or age > 7:
-              raise RuntimeError(
-                  f"Price date is stale or in the future: {price_date}"
+          def parse_tindex_date(text):
+              normalized = text.translate(DIGITS)
+              pattern = (
+                  r"(\d{1,2})\s+(فروردین|اردیبهشت|خرداد|تیر|مرداد|"
+                  r"شهریور|مهر|آبان|آذر|دی|بهمن|اسفند)\s+(\d{4})"
               )
+              match = re.search(pattern, normalized)
+              if not match:
+                  raise RuntimeError("Tindex page date was not found.")
+              day = int(match.group(1))
+              month = MONTHS[match.group(2)]
+              year = int(match.group(3))
+              if not 1 <= day <= 31:
+                  raise RuntimeError("Invalid Jalali day on Tindex.")
+              return year, month, day
 
-          source_url = result.get("source_url", "")
+          def fetch_tindex():
+              page = get_url(TINDEX_URL)
+              if normalize_text(SYMBOL) not in normalize_text(page):
+                  raise RuntimeError("Tindex page does not identify Kahroba.")
 
-          if not valid_domain(source_url):
-              raise RuntimeError("Primary source domain is not approved.")
+              plain = html.unescape(page)
+              plain = re.sub(r"(?is)<script\b.*?</script>", " ", plain)
+              plain = re.sub(r"(?is)<style\b.*?</style>", " ", plain)
+              plain = re.sub(r"<[^>]+>", " ", plain)
+              plain = re.sub(r"\s+", " ", plain)
 
-          # Source must actually appear in OpenAI's web-search results.
-          if source_url not in searched_sources:
-              raise RuntimeError(
-                  "Primary source URL was not found in actual search sources."
+              price_match = re.search(
+                  r"قیمت\s*پایانی\s*[:：]?\s*"
+                  r"([0-9۰-۹٠-٩٬,٫]+)\s*ریال",
+                  plain
               )
-
-          second_url = result.get("second_source_url")
-
-          if second_url:
-              if not valid_domain(second_url):
-                  raise RuntimeError("Invalid second source domain.")
-              if second_url not in searched_sources:
+              if not price_match:
                   raise RuntimeError(
-                      "Second source was not found in search results."
+                      "Clearly labeled Tindex closing price in Rial was not found."
                   )
 
-          # Store only after all validation checks pass.
-          fetched_at = datetime.now(timezone.utc).isoformat()
+              price = to_price(price_match.group(1))
+              if price is None:
+                  raise RuntimeError("Tindex closing price is invalid.")
 
-          payload = {
+              jalali_date = parse_tindex_date(plain)
+              price_date = jalali_to_gregorian(*jalali_date)
+              today_tehran = datetime.now(
+                  ZoneInfo("Asia/Tehran")
+              ).date()
+              age_days = (today_tehran - price_date).days
+
+              if age_days < 0 or age_days > 7:
+                  raise RuntimeError(
+                      f"Tindex price date is stale or future: {jalali_date}"
+                  )
+
+              return {
+                  "price": price,
+                  "jalali_date": jalali_date,
+                  "gregorian_date": price_date.isoformat(),
+                  "url": TINDEX_URL,
+              }
+
+          def walk_instruments(data, found):
+              if isinstance(data, dict):
+                  ticker = normalize_text(data.get("lVal18AFC", ""))
+                  code = data.get("insCode")
+                  if ticker == normalize_text(SYMBOL) and code:
+                      found.add(str(code))
+                  for value in data.values():
+                      walk_instruments(value, found)
+              elif isinstance(data, list):
+                  for value in data:
+                      walk_instruments(value, found)
+
+          def fetch_tsetmc():
+              search_data = get_json(TSETMC_SEARCH_URL)
+              codes = set()
+              walk_instruments(search_data, codes)
+
+              if len(codes) != 1:
+                  raise RuntimeError(
+                      f"Expected one exact TSETMC symbol match; found {len(codes)}."
+                  )
+
+              code = next(iter(codes))
+              history_url = (
+                  "https://cdn.tsetmc.com/api/ClosingPrice/"
+                  f"GetClosingPriceDailyList/{code}/10"
+              )
+              history_data = get_json(history_url)
+              rows = history_data.get("closingPriceDaily", [])
+
+              if not isinstance(rows, list) or not rows:
+                  raise RuntimeError("TSETMC daily closing-price history is empty.")
+
+              valid_rows = []
+              for row in rows:
+                  if not isinstance(row, dict):
+                      continue
+                  date_value = str(row.get("dEven", ""))
+                  price_value = to_price(row.get("pClosing"))
+                  if re.fullmatch(r"\d{8}", date_value) and price_value:
+                      valid_rows.append((date_value, price_value))
+
+              if not valid_rows:
+                  raise RuntimeError("No valid TSETMC daily closing-price record.")
+
+              latest_date, latest_price = max(valid_rows, key=lambda item: item[0])
+              parsed = datetime.strptime(latest_date, "%Y%m%d").date()
+              jalali = gregorian_to_jalali(
+                  parsed.year, parsed.month, parsed.day
+              )
+              return {
+                  "price": latest_price,
+                  "jalali_date": jalali,
+                  "gregorian_date": parsed.isoformat(),
+                  "url": history_url,
+                  "instrument_code": code,
+              }
+
+          # Tindex is the primary source requested for this project.
+          tindex = fetch_tindex()
+
+          # TSETMC is an independent cross-check when reachable.
+          tsetmc = None
+          crosscheck_error = None
+          try:
+              tsetmc = fetch_tsetmc()
+          except Exception as exc:
+              crosscheck_error = f"{type(exc).__name__}: {exc}"
+              print("TSETMC_CROSSCHECK_UNAVAILABLE:", crosscheck_error)
+
+          if tsetmc is not None:
+              if tsetmc["jalali_date"] != tindex["jalali_date"]:
+                  raise RuntimeError(
+                      "Source dates differ: "
+                      f"Tindex={tindex['jalali_date']}, "
+                      f"TSETMC={tsetmc['jalali_date']}. No data will be saved."
+                  )
+              if tsetmc["price"] != tindex["price"]:
+                  raise RuntimeError(
+                      "Closing prices differ: "
+                      f"Tindex={tindex['price']}, "
+                      f"TSETMC={tsetmc['price']}. No data will be saved."
+                  )
+
+          fetched_at = datetime.now(timezone.utc).isoformat()
+          errors = [crosscheck_error] if crosscheck_error else []
+
+          result = {
               "symbol": SYMBOL,
-              "source": result.get("source_name"),
-              "source_url": source_url,
-              "second_source_url": second_url,
-              "closing_price_irr": price,
-              "closing_price_toman": price / 10,
+              "source": "Tindex",
+              "source_url": tindex["url"],
+              "second_source_url": tsetmc["url"] if tsetmc else None,
+              "closing_price_irr": tindex["price"],
+              "closing_price_toman": tindex["price"] / 10,
               "currency": "IRR",
               "data_type": "closing_price",
-              "price_date": price_date,
+              "price_date_jalali": (
+                  f"{tindex['jalali_date'][0]:04d}/"
+                  f"{tindex['jalali_date'][1]:02d}/"
+                  f"{tindex['jalali_date'][2]:02d}"
+              ),
+              "price_date": tindex["gregorian_date"],
               "fetched_at_utc": fetched_at,
               "verification_status": "verified",
-              "confidence": "high",
-              "verification_reason": result.get("reason"),
-              "searched_sources": searched_sources
+              "verification_method": (
+                  "Tindex labeled closing price and date parsed; "
+                  + (
+                      "exact TSETMC price/date cross-check passed."
+                      if tsetmc else
+                      "TSETMC cross-check unavailable; Tindex primary validation only."
+                  )
+              ),
+              "failover_errors": errors,
           }
 
-          with open(
-              "kahroba-price.json", "w", encoding="utf-8"
-          ) as file:
-              json.dump(payload, file, ensure_ascii=False, indent=2)
+          with open("kahroba-price.json", "w", encoding="utf-8") as file:
+              json.dump(result, file, ensure_ascii=False, indent=2)
 
-          print("PRICE_VERIFIED: YES")
+          print("PRICE_VERIFIED:", "YES")
           print("SYMBOL:", SYMBOL)
-          print("PRICE_RIAL:", price)
-          print("PRICE_TOMAN:", price / 10)
-          print("PRICE_DATE:", price_date)
-          print("SOURCE:", result.get("source_name"))
-          print("SOURCE_URL:", source_url)
-          print("FETCHED_AT:", fetched_at)
+          print("SOURCE: Tindex")
+          print("CLOSING_PRICE_RIAL:", tindex["price"])
+          print("CLOSING_PRICE_TOMAN:", tindex["price"] / 10)
+          print("PRICE_DATE_JALALI:", result["price_date_jalali"])
+          print("PRICE_DATE_GREGORIAN:", result["price_date"])
+          print("TSETMC_CROSSCHECK:", "PASSED" if tsetmc else "UNAVAILABLE")
+          print("FETCHED_AT_UTC:", fetched_at)
 
           with open(
-              os.environ["GITHUB_STEP_SUMMARY"],
+              __import__("os").environ["GITHUB_STEP_SUMMARY"],
               "a", encoding="utf-8"
           ) as summary:
               summary.write("# گزارش قیمت کهربا\n\n")
-              summary.write("- وضعیت: تأیید شده\n")
-              summary.write(f"- تاریخ قیمت: {price_date}\n")
-              summary.write(f"- قیمت پایانی: {price:,} ریال\n")
-              summary.write(f"- قیمت پایانی: {price / 10:,.1f} تومان\n")
-              summary.write(f"- منبع: {result.get('source_name')}\n")
-              summary.write(f"- لینک: {source_url}\n")
+              summary.write("- منبع اصلی: Tindex\n")
+              summary.write(f"- قیمت پایانی: {tindex['price']:,} ریال\n")
+              summary.write(f"- قیمت پایانی: {tindex['price'] / 10:,.1f} تومان\n")
+              summary.write(f"- تاریخ قیمت: {result['price_date_jalali']}\n")
+              summary.write(
+                  "- تطبیق TSETMC: "
+                  + ("موفق\n" if tsetmc else "در دسترس نبود؛ فقط Tindex بررسی شد\n")
+              )
               summary.write(f"- زمان دریافت: {fetched_at}\n")
           PY
 
@@ -299,20 +389,30 @@ jobs:
           url = os.environ.get("GOOGLE_APPS_SCRIPT_URL", "").strip()
           secret = os.environ.get("KAHROBA_WEBHOOK_SECRET", "").strip()
 
-          if not url or not secret:
-              raise RuntimeError("Google Sheets secrets are missing.")
+          if not url:
+              raise RuntimeError("GOOGLE_APPS_SCRIPT_URL secret is missing")
+          if not secret:
+              raise RuntimeError("KAHROBA_WEBHOOK_SECRET secret is missing")
 
-          with open("kahroba-price.json", encoding="utf-8") as file:
+          with open("kahroba-price.json", "r", encoding="utf-8") as file:
               payload = json.load(file)
 
           if payload.get("verification_status") != "verified":
               raise RuntimeError("Unverified data cannot be saved.")
 
-          payload["secret"] = secret
+          if payload.get("source") != "Tindex":
+              raise RuntimeError("Unexpected primary price source.")
 
+          if not payload.get("source_url", "").startswith(
+              "https://tindex.app/stocks/"
+          ):
+              raise RuntimeError("Primary source URL is not approved.")
+
+          payload["secret"] = secret
+          body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
           request = urllib.request.Request(
               url,
-              data=json.dumps(payload).encode("utf-8"),
+              data=body,
               headers={"Content-Type": "application/json"},
               method="POST"
           )
@@ -324,34 +424,32 @@ jobs:
                       "utf-8", errors="replace"
                   )
           except urllib.error.HTTPError as error:
-              details = error.read().decode(
-                  "utf-8", errors="replace"
-              )
+              details = error.read().decode("utf-8", errors="replace")
               raise RuntimeError(
-                  f"Google Sheets HTTP {error.code}: {details[:1000]}"
+                  f"Google Sheets HTTP error {error.code}: {details[:1000]}"
               )
 
-          print("HTTP_STATUS:", status)
-          print("RESPONSE:", response_text[:1000])
+          print("GOOGLE_SHEETS_HTTP_STATUS:", status)
+          print("GOOGLE_SHEETS_RESPONSE:", response_text[:1000])
 
           try:
               confirmation = json.loads(response_text)
           except json.JSONDecodeError:
-              raise RuntimeError("Google Apps Script returned invalid JSON.")
+              raise RuntimeError("Google Apps Script did not return JSON.")
 
           if confirmation.get("ok") is not True:
-              raise RuntimeError("Google Sheets did not confirm success.")
-
+              raise RuntimeError(
+                  "Google Apps Script did not confirm success: "
+                  + str(confirmation)
+              )
           if confirmation.get("saved") is not True:
-              raise RuntimeError("Google Sheets did not confirm saved row.")
-
+              raise RuntimeError("Google Apps Script did not confirm saved row.")
           if confirmation.get("symbol") != payload["symbol"]:
-              raise RuntimeError("Saved symbol mismatch.")
-
+              raise RuntimeError("Saved symbol does not match.")
           if int(confirmation.get("price", 0)) != int(
               payload["closing_price_irr"]
           ):
-              raise RuntimeError("Saved price mismatch.")
+              raise RuntimeError("Saved price does not match.")
 
           print("GOOGLE_SHEETS_SAVE_CONFIRMED: YES")
           print("SAVED_SYMBOL:", confirmation["symbol"])
