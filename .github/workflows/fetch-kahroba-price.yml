@@ -12,7 +12,7 @@ permissions:
 jobs:
   fetch-price:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
 
     steps:
       - name: Checkout repository
@@ -23,197 +23,269 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Fetch and save Kahroba price
+      - name: Ask OpenAI to verify Kahroba closing price
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           python - <<'PY'
+          import os
           import json
           import re
-          import time
-          import os
-          import html
           import urllib.request
-          import urllib.parse
-          from datetime import datetime, timezone
+          import urllib.error
+          from datetime import datetime, date, timezone
+          from zoneinfo import ZoneInfo
+          from urllib.parse import urlparse
 
           SYMBOL = "کهربا"
+          MODEL = "gpt-6-astra"
 
-          HEADERS = {
-              "User-Agent": "Mozilla/5.0",
-              "Accept": "application/json,text/html,*/*"
+          ALLOWED_DOMAINS = {
+              "tsetmc.com",
+              "tindex.app",
+              "rahavard365.com"
           }
 
-          def get_url(url, timeout=20):
-              req = urllib.request.Request(url, headers=HEADERS)
-              with urllib.request.urlopen(req, timeout=timeout) as response:
-                  return response.read().decode("utf-8", errors="replace")
+          api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+          if not api_key:
+              raise RuntimeError("OPENAI_API_KEY secret is missing")
 
-          def to_number(value):
-              if value is None:
-                  return None
-              text = str(value)
-              text = text.translate(str.maketrans(
-                  "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
-                  "01234567890123456789"
-              ))
-              text = text.replace(",", "").replace("٬", "").strip()
-              try:
-                  return int(float(text))
-              except (ValueError, TypeError):
-                  return None
+          prompt = """
+          وظیفه تو استخراج و اعتبارسنجی قیمت پایانی صندوق کهربا در بورس ایران است.
 
-          def find_instrument(data):
-              if isinstance(data, dict):
-                  code = data.get("insCode")
-                  names = [
-                      str(data.get("lVal18AFC", "")),
-                      str(data.get("lVal30", "")),
-                      str(data.get("lVal18", ""))
-                  ]
-                  if code and any(SYMBOL in name for name in names):
-                      return str(code)
+          قوانین الزامی:
+          1. فقط قیمت پایانی رسمی را استخراج کن، نه آخرین معامله.
+          2. واحد قیمت حتماً ریال باشد.
+          3. تاریخ آخرین جلسه معاملاتی تکمیل‌شده را مشخص کن.
+          4. منابع معتبر را جستجو کن؛ اولویت با TSETMC است.
+          5. در صورت امکان قیمت را با منبع دوم نیز تطبیق بده.
+          6. هیچ عددی را حدس نزن یا از داده قدیمی استنتاج نکن.
+          7. لینک منبع باید مستقیم و قابل بررسی باشد.
+          8. اگر قیمت یا تاریخ یا منبع قابل تأیید نیست،
+             verified را false قرار بده.
+          9. قیمت باید عدد صحیح مثبت و به ریال باشد.
+          10. اگر منابع اختلاف دارند، verified=false.
+          11. تاریخ باید میلادی و به شکل YYYY-MM-DD باشد.
+          12. اگر بازار تعطیل است، آخرین جلسه معاملاتی کامل را گزارش کن.
 
-                  for value in data.values():
-                      result = find_instrument(value)
-                      if result:
-                          return result
+          فقط JSON معتبر و بدون Markdown برگردان:
 
-              elif isinstance(data, list):
-                  for item in data:
-                      result = find_instrument(item)
-                      if result:
-                          return result
+          {
+            "symbol": "کهربا",
+            "verified": true,
+            "closing_price_irr": 12345,
+            "price_date": "2026-11-15",
+            "price_type": "closing_price",
+            "currency": "IRR",
+            "source_name": "TSETMC",
+            "source_url": "https://...",
+            "second_source_url": null,
+            "confidence": "high",
+            "reason": "توضیح کوتاه اعتبارسنجی"
+          }
 
-              return None
+          اگر اطلاعات تأیید نشد، verified=false و قیمت null باشد.
+          هرگز اطلاعات ساختگی تولید نکن.
+          """
 
-          def find_closing_price(data):
-              if isinstance(data, dict):
-                  value = to_number(data.get("pClosing"))
-                  if value and value > 0:
-                      return value
+          request_body = {
+              "model": MODEL,
+              "tools": [{
+                  "type": "web_search",
+                  "search_context_size": "high",
+                  "filters": {
+                      "allowed_domains": sorted(ALLOWED_DOMAINS)
+                  }
+              }],
+              "include": [
+                  "web_search_call.action.sources"
+              ],
+              "input": prompt
+          }
 
-                  for item in data.values():
-                      result = find_closing_price(item)
-                      if result:
-                          return result
+          req = urllib.request.Request(
+              "https://api.openai.com/v1/responses",
+              data=json.dumps(request_body).encode("utf-8"),
+              headers={
+                  "Authorization": f"Bearer {api_key}",
+                  "Content-Type": "application/json"
+              },
+              method="POST"
+          )
 
-              elif isinstance(data, list):
-                  for item in data:
-                      result = find_closing_price(item)
-                      if result:
-                          return result
-
-              return None
-
-          def fetch_tsetmc():
-              search_url = (
-                  "https://cdn.tsetmc.com/api/Instrument/GetInstrumentSearch/"
-                  + urllib.parse.quote(SYMBOL)
-              )
-
-              search_data = json.loads(get_url(search_url))
-              instrument_code = find_instrument(search_data)
-
-              if not instrument_code:
-                  raise RuntimeError("Kahroba instrument code not found")
-
-              price_url = (
-                  "https://cdn.tsetmc.com/api/ClosingPrice/GetClosingPriceInfo/"
-                  + instrument_code
-              )
-
-              price_data = json.loads(get_url(price_url))
-              closing_price = find_closing_price(price_data)
-
-              if not closing_price:
-                  raise RuntimeError("TSETMC closing price not found")
-
-              return closing_price, price_url
-
-          def fetch_tindex():
-              url = "https://tindex.app/stocks/کهربا/"
-              page = get_url(url)
-              text = html.unescape(re.sub(r"<[^>]+>", " ", page))
-              text = re.sub(r"\s+", " ", text)
-
-              patterns = [
-                  r"قیمت\s*پایانی\s*[:：]?\s*([\d,٬]+)",
-                  r"پایانی\s*[:：]?\s*([\d,٬]+)"
-              ]
-
-              for pattern in patterns:
-                  match = re.search(pattern, text)
-                  if match:
-                      price = to_number(match.group(1))
-                      if price and price > 0:
-                          return price, url
-
+          try:
+              with urllib.request.urlopen(req, timeout=150) as response:
+                  api_data = json.loads(
+                      response.read().decode("utf-8")
+                  )
+          except urllib.error.HTTPError as exc:
+              details = exc.read().decode("utf-8", errors="replace")
               raise RuntimeError(
-                  "Could not identify a clearly labeled closing price on Tindex"
+                  f"OpenAI API HTTP {exc.code}: {details[:1500]}"
               )
 
-          closing_price = None
-          source = None
-          source_url = None
-          errors = []
-
-          # First choice: TSETMC
-          for attempt in range(2):
-              try:
-                  closing_price, source_url = fetch_tsetmc()
-                  source = "TSETMC"
-                  break
-              except Exception as exc:
-                  errors.append(f"TSETMC attempt {attempt + 1}: {exc}")
-                  time.sleep(2)
-
-          # Backup: Tindex
-          if closing_price is None:
-              for attempt in range(2):
-                  try:
-                      closing_price, source_url = fetch_tindex()
-                      source = "Tindex"
-                      break
-                  except Exception as exc:
-                      errors.append(f"Tindex attempt {attempt + 1}: {exc}")
-                      time.sleep(2)
-
-          if closing_price is None:
+          if api_data.get("status") != "completed":
               raise RuntimeError(
-                  "Unable to fetch Kahroba price. " + " | ".join(errors)
+                  "OpenAI response did not complete: "
+                  + str(api_data.get("status"))
               )
 
+          output_text = ""
+          searched_sources = []
+
+          for item in api_data.get("output", []):
+              if item.get("type") == "web_search_call":
+                  action = item.get("action") or {}
+                  for source in action.get("sources", []):
+                      url = source.get("url")
+                      if url:
+                          searched_sources.append(url)
+
+              if item.get("type") == "message":
+                  for content in item.get("content", []):
+                      if content.get("type") == "output_text":
+                          output_text += content.get("text", "")
+
+          if not searched_sources:
+              raise RuntimeError(
+                  "No actual web search sources were returned."
+              )
+
+          if not output_text.strip():
+              raise RuntimeError("OpenAI returned no usable answer.")
+
+          try:
+              result = json.loads(output_text)
+          except json.JSONDecodeError:
+              raise RuntimeError(
+                  "OpenAI response was not valid JSON: "
+                  + output_text[:1000]
+              )
+
+          def normalize_domain(url):
+              parsed = urlparse(url)
+              if parsed.scheme != "https":
+                  return None
+              return (parsed.hostname or "").lower()
+
+          def valid_domain(url):
+              domain = normalize_domain(url)
+              if not domain:
+                  return False
+              return any(
+                  domain == allowed or domain.endswith("." + allowed)
+                  for allowed in ALLOWED_DOMAINS
+              )
+
+          if result.get("verified") is not True:
+              raise RuntimeError(
+                  "AI could not verify the price: "
+                  + str(result.get("reason", "Unknown reason"))
+              )
+
+          if result.get("symbol") != SYMBOL:
+              raise RuntimeError("Symbol mismatch.")
+
+          if result.get("price_type") != "closing_price":
+              raise RuntimeError("Price is not closing price.")
+
+          if result.get("currency") != "IRR":
+              raise RuntimeError("Price currency must be IRR.")
+
+          if result.get("confidence") != "high":
+              raise RuntimeError("Confidence is not high.")
+
+          price = result.get("closing_price_irr")
+          if isinstance(price, bool) or not isinstance(price, int) or price <= 0:
+              raise RuntimeError("Invalid closing price.")
+
+          price_date = result.get("price_date")
+          try:
+              parsed_date = date.fromisoformat(price_date)
+          except (ValueError, TypeError):
+              raise RuntimeError("Invalid price date.")
+
+          today_tehran = datetime.now(
+              ZoneInfo("Asia/Tehran")
+          ).date()
+
+          age = (today_tehran - parsed_date).days
+
+          if age < 0 or age > 7:
+              raise RuntimeError(
+                  f"Price date is stale or in the future: {price_date}"
+              )
+
+          source_url = result.get("source_url", "")
+
+          if not valid_domain(source_url):
+              raise RuntimeError("Primary source domain is not approved.")
+
+          # Source must actually appear in OpenAI's web-search results.
+          if source_url not in searched_sources:
+              raise RuntimeError(
+                  "Primary source URL was not found in actual search sources."
+              )
+
+          second_url = result.get("second_source_url")
+
+          if second_url:
+              if not valid_domain(second_url):
+                  raise RuntimeError("Invalid second source domain.")
+              if second_url not in searched_sources:
+                  raise RuntimeError(
+                      "Second source was not found in search results."
+                  )
+
+          # Store only after all validation checks pass.
           fetched_at = datetime.now(timezone.utc).isoformat()
 
-          result = {
+          payload = {
               "symbol": SYMBOL,
-              "source": source,
+              "source": result.get("source_name"),
               "source_url": source_url,
-              "closing_price_irr": closing_price,
-              "closing_price_toman": closing_price / 10,
+              "second_source_url": second_url,
+              "closing_price_irr": price,
+              "closing_price_toman": price / 10,
               "currency": "IRR",
               "data_type": "closing_price",
+              "price_date": price_date,
               "fetched_at_utc": fetched_at,
-              "failover_errors": errors
+              "verification_status": "verified",
+              "confidence": "high",
+              "verification_reason": result.get("reason"),
+              "searched_sources": searched_sources
           }
 
-          with open("kahroba-price.json", "w", encoding="utf-8") as file:
-              json.dump(result, file, ensure_ascii=False, indent=2)
+          with open(
+              "kahroba-price.json", "w", encoding="utf-8"
+          ) as file:
+              json.dump(payload, file, ensure_ascii=False, indent=2)
 
+          print("PRICE_VERIFIED: YES")
           print("SYMBOL:", SYMBOL)
-          print("SOURCE:", source)
-          print("CLOSING_PRICE_RIAL:", closing_price)
-          print("CLOSING_PRICE_TOMAN:", closing_price / 10)
-          print("FETCHED_AT_UTC:", fetched_at)
+          print("PRICE_RIAL:", price)
+          print("PRICE_TOMAN:", price / 10)
+          print("PRICE_DATE:", price_date)
+          print("SOURCE:", result.get("source_name"))
+          print("SOURCE_URL:", source_url)
+          print("FETCHED_AT:", fetched_at)
 
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+          with open(
+              os.environ["GITHUB_STEP_SUMMARY"],
+              "a", encoding="utf-8"
+          ) as summary:
               summary.write("# گزارش قیمت کهربا\n\n")
-              summary.write(f"- منبع: {source}\n")
-              summary.write(f"- قیمت پایانی: {closing_price:,} ریال\n")
-              summary.write(f"- قیمت پایانی: {closing_price / 10:,.1f} تومان\n")
+              summary.write("- وضعیت: تأیید شده\n")
+              summary.write(f"- تاریخ قیمت: {price_date}\n")
+              summary.write(f"- قیمت پایانی: {price:,} ریال\n")
+              summary.write(f"- قیمت پایانی: {price / 10:,.1f} تومان\n")
+              summary.write(f"- منبع: {result.get('source_name')}\n")
+              summary.write(f"- لینک: {source_url}\n")
               summary.write(f"- زمان دریافت: {fetched_at}\n")
           PY
 
-      - name: Send price to Google Sheets
+      - name: Send verified price to Google Sheets
         env:
           GOOGLE_APPS_SCRIPT_URL: ${{ secrets.GOOGLE_APPS_SCRIPT_URL }}
           KAHROBA_WEBHOOK_SECRET: ${{ secrets.KAHROBA_WEBHOOK_SECRET }}
@@ -227,22 +299,20 @@ jobs:
           url = os.environ.get("GOOGLE_APPS_SCRIPT_URL", "").strip()
           secret = os.environ.get("KAHROBA_WEBHOOK_SECRET", "").strip()
 
-          if not url:
-              raise RuntimeError("GOOGLE_APPS_SCRIPT_URL secret is missing")
+          if not url or not secret:
+              raise RuntimeError("Google Sheets secrets are missing.")
 
-          if not secret:
-              raise RuntimeError("KAHROBA_WEBHOOK_SECRET secret is missing")
-
-          with open("kahroba-price.json", "r", encoding="utf-8") as file:
+          with open("kahroba-price.json", encoding="utf-8") as file:
               payload = json.load(file)
+
+          if payload.get("verification_status") != "verified":
+              raise RuntimeError("Unverified data cannot be saved.")
 
           payload["secret"] = secret
 
-          body = json.dumps(payload).encode("utf-8")
-
           request = urllib.request.Request(
               url,
-              data=body,
+              data=json.dumps(payload).encode("utf-8"),
               headers={"Content-Type": "application/json"},
               method="POST"
           )
@@ -253,45 +323,35 @@ jobs:
                   response_text = response.read().decode(
                       "utf-8", errors="replace"
                   )
-
           except urllib.error.HTTPError as error:
-              response_text = error.read().decode(
+              details = error.read().decode(
                   "utf-8", errors="replace"
               )
               raise RuntimeError(
-                  f"Google Sheets HTTP error: {error.code}. "
-                  f"Response: {response_text[:1000]}"
+                  f"Google Sheets HTTP {error.code}: {details[:1000]}"
               )
 
-          print("GOOGLE_SHEETS_HTTP_STATUS:", status)
-          print("GOOGLE_SHEETS_RESPONSE:", response_text[:1000])
+          print("HTTP_STATUS:", status)
+          print("RESPONSE:", response_text[:1000])
 
           try:
               confirmation = json.loads(response_text)
           except json.JSONDecodeError:
-              raise RuntimeError(
-                  "Google Apps Script did not return JSON. "
-                  "Check Web App deployment and access settings."
-              )
+              raise RuntimeError("Google Apps Script returned invalid JSON.")
 
           if confirmation.get("ok") is not True:
-              raise RuntimeError(
-                  "Google Apps Script did not confirm success: "
-                  + str(confirmation)
-              )
+              raise RuntimeError("Google Sheets did not confirm success.")
 
           if confirmation.get("saved") is not True:
-              raise RuntimeError(
-                  "Google Apps Script did not confirm that the row was saved."
-              )
+              raise RuntimeError("Google Sheets did not confirm saved row.")
 
           if confirmation.get("symbol") != payload["symbol"]:
-              raise RuntimeError("Saved symbol does not match.")
+              raise RuntimeError("Saved symbol mismatch.")
 
           if int(confirmation.get("price", 0)) != int(
               payload["closing_price_irr"]
           ):
-              raise RuntimeError("Saved price does not match.")
+              raise RuntimeError("Saved price mismatch.")
 
           print("GOOGLE_SHEETS_SAVE_CONFIRMED: YES")
           print("SAVED_SYMBOL:", confirmation["symbol"])
