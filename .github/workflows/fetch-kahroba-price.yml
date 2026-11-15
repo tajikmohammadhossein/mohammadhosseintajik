@@ -79,6 +79,42 @@ jobs:
           else:
               raise SystemExit(f"Price fetch failed after 3 attempts: {error}")
           PY
+      - name: Send price to Google Sheets
+        env:
+          GOOGLE_APPS_SCRIPT_URL: ${{ secrets.GOOGLE_APPS_SCRIPT_URL }}
+        shell: bash
+        run: |
+          if [ -z "$GOOGLE_APPS_SCRIPT_URL" ]; then
+            echo "GOOGLE_SHEETS_NOT_CONFIGURED: Add the deployed Apps Script Web App URL as repository secret GOOGLE_APPS_SCRIPT_URL." >> "$GITHUB_STEP_SUMMARY"
+            echo "Google Sheets write skipped: GOOGLE_APPS_SCRIPT_URL secret is not configured."
+            exit 0
+          fi
+          python - <<'PY'
+          import json, os
+          from urllib.request import Request, urlopen
+          with open("kahroba-price.json", encoding="utf-8") as f:
+              payload = json.load(f)
+          req = Request(
+              os.environ["GOOGLE_APPS_SCRIPT_URL"],
+              data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+              headers={"Content-Type": "application/json"},
+              method="POST"
+          )
+          with urlopen(req, timeout=30) as response:
+              body = response.read().decode("utf-8", "replace")
+              print("GOOGLE_SHEETS_HTTP_STATUS:", response.status)
+              print("GOOGLE_SHEETS_RESPONSE:", body[:2000])
+              if response.status < 200 or response.status >= 300:
+                  raise RuntimeError("Google Apps Script returned a non-success HTTP status")
+          try:
+              result = json.loads(body)
+          except Exception:
+              result = {}
+          if result.get("ok") is not True:
+              raise RuntimeError("Google Apps Script did not confirm success: " + body[:500])
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+              f.write("\\n- Google Sheets: **ثبت با تأیید سرور انجام شد**\\n")
+          PY
       - name: Upload price JSON
         uses: actions/upload-artifact@v4
         with:
