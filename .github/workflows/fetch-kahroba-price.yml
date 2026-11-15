@@ -1,0 +1,88 @@
+name: Fetch Kahroba price
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/15 * * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-price:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Fetch and parse Kahroba price from Tindex
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, re, time, os
+          from datetime import datetime, timezone
+          from html.parser import HTMLParser
+          from urllib.request import Request, urlopen
+
+          URL = "https://tindex.app/stocks/%DA%A9%D9%87%D8%B1%D8%A8%D8%A7/"
+          TRANS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+
+          class Text(HTMLParser):
+              def __init__(self):
+                  super().__init__(); self.parts = []
+              def handle_data(self, data):
+                  if data.strip(): self.parts.append(data.strip())
+
+          def number(s):
+              return int(s.translate(TRANS).replace("٬", "").replace(",", "").replace(" ", ""))
+
+          error = None
+          for attempt in range(3):
+              try:
+                  req = Request(URL, headers={"User-Agent": "Mozilla/5.0 KahrobaPriceBot/1.0"})
+                  with urlopen(req, timeout=30) as response:
+                      html = response.read().decode("utf-8", "replace")
+                      status = response.status
+                  parser = Text(); parser.feed(html)
+                  page = " ".join(parser.parts)
+                  last = re.search(r"آخرین\s*قیمت\s*([۰-۹0-9٬,]+)\s*ریال", page)
+                  close = re.search(r"قیمت\s*پایانی\s*([۰-۹0-9٬,]+)\s*ریال", page)
+                  if not last and not close:
+                      raise RuntimeError("Price fields not found; Tindex page format may have changed.")
+                  last_irr = number(last.group(1)) if last else None
+                  close_irr = number(close.group(1)) if close else None
+                  result = {
+                      "symbol": "کهربا", "source": "Tindex", "source_url": URL,
+                      "http_status": status, "last_price_irr": last_irr,
+                      "closing_price_irr": close_irr,
+                      "last_price_toman": last_irr / 10 if last_irr is not None else None,
+                      "closing_price_toman": close_irr / 10 if close_irr is not None else None,
+                      "fetched_at_utc": datetime.now(timezone.utc).isoformat()
+                  }
+                  with open("kahroba-price.json", "w", encoding="utf-8") as f:
+                      json.dump(result, f, ensure_ascii=False, indent=2)
+                  print("PRICE_FETCH_SUCCESS")
+                  print(f"LAST_PRICE_RIAL: {last_irr}")
+                  print(f"CLOSING_PRICE_RIAL: {close_irr}")
+                  print(f"LAST_PRICE_TOMAN: {result['last_price_toman']}")
+                  print(f"CLOSING_PRICE_TOMAN: {result['closing_price_toman']}")
+                  print(f"SOURCE: {URL}")
+                  print(f"FETCHED_AT_UTC: {result['fetched_at_utc']}")
+                  with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+                      f.write("# قیمت صندوق کهربا\n\n")
+                      f.write(f"- آخرین قیمت: **{last_irr:,} ریال**\n" if last_irr is not None else "- آخرین قیمت: ناموجود\n")
+                      f.write(f"- قیمت پایانی: **{close_irr:,} ریال**\n" if close_irr is not None else "- قیمت پایانی: ناموجود\n")
+                      f.write(f"- منبع: [Tindex]({URL})\n- زمان دریافت UTC: {result['fetched_at_utc']}\n")
+                  break
+              except Exception as exc:
+                  error = exc
+                  print(f"ATTEMPT_{attempt+1}_FAILED: {type(exc).__name__}: {exc}")
+                  if attempt < 2: time.sleep(5)
+          else:
+              raise SystemExit(f"Price fetch failed after 3 attempts: {error}")
+          PY
+      - name: Upload price JSON
+        uses: actions/upload-artifact@v4
+        with:
+          name: kahroba-price
+          path: kahroba-price.json
+          if-no-files-found: error
+          retention-days: 14
